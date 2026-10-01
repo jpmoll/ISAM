@@ -1,102 +1,111 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "datos.h"
 
-/*
- * PERSONA A: implementar los TODO de abajo.
- *
- * `datos_factor_bloque`, `datos_reservar_bloque` y `datos_liberar_bloque`
- * ya están resueltas (dependen solo de registro_tam_actual(), no de cómo
- * decidan guardar el archivo), no hace falta tocarlas.
- *
- * Sugerencia de flujo para lo que falta:
- *   1. datos_crear(): fopen(ruta_archivo, "wb"), recorrer regs_ordenados
- *      de datos_factor_bloque() en datos_factor_bloque(), armar cada
- *      Bloque (datos_reservar_bloque + llenar) y escribirlo.
- *      OJO al escribir a disco: no usen sizeof(Registro) completo (eso
- *      escribiría TAM_REGISTRO_MAX bytes por registro, desperdiciando
- *      espacio); escriban solo
- *      `sizeof(int) + registro_tam_actual()` bytes por registro, que es
- *      lo que en verdad ocupa la tabla activa.
- *   2. datos_abrir()/datos_cerrar(): fopen/fclose en modo "r+b".
- *   3. datos_leer_bloque()/datos_escribir_bloque(): fseek al offset
- *      num_bloque * TAMAÑO_PAGINA_EN_DISCO (usando el tamaño real por
- *      registro del punto 1, más espacio para n y ptr_overflow) y luego
- *      leer/escribir esa página.
- *   4. datos_num_bloques(): tamaño del archivo (fseek a SEEK_END + ftell)
- *      dividido entre el tamaño real de una página en disco.
- *   5. datos_buscar_en_bloque(): datos_reservar_bloque + datos_leer_bloque
- *      y búsqueda binaria (o lineal) sobre sus `n` registros ocupados.
- */
+struct DataArea {
+    FILE *fp;
+    long  accesos;
+};
 
-static FILE *fp = NULL;
-static int factor_bloque_cache = 0;
-
-int datos_factor_bloque(void) {
-    int tam_en_disco = (int)sizeof(int) + registro_tam_actual();
-    factor_bloque_cache = TAM_PAGINA / tam_en_disco;
-    if (factor_bloque_cache < 1) factor_bloque_cache = 1; // registro más grande que una página
-    return factor_bloque_cache;
+size_t da_bloque_bytes(void) {
+    return sizeof(int32_t) + sizeof(int64_t) + ISAM_REGS_POR_BLOQUE * registro_bytes();
 }
 
-bool datos_reservar_bloque(Bloque *bloque) {
-    int factor = datos_factor_bloque();
-    bloque->regs = malloc(sizeof(Registro) * (size_t)factor);
-    bloque->n = 0;
-    bloque->ptr_overflow = -1;
-    return bloque->regs != NULL;
+DataArea *da_abrir(const char *ruta) {
+    DataArea *da = calloc(1, sizeof(DataArea));
+    if (!da) return NULL;
+
+    da->fp = fopen(ruta, "r+b");
+    if (!da->fp) da->fp = fopen(ruta, "w+b");
+    if (!da->fp) { free(da); return NULL; }
+
+    return da;
 }
 
-void datos_liberar_bloque(Bloque *bloque) {
-    free(bloque->regs);
-    bloque->regs = NULL;
+void da_cerrar(DataArea *da) {
+    if (!da) return;
+    if (da->fp) fclose(da->fp);
+    free(da);
 }
 
-bool datos_crear(const char *ruta_archivo, const Registro *regs_ordenados, int n_regs) {
-    // TODO: implementar
-    (void)ruta_archivo;
-    (void)regs_ordenados;
-    (void)n_regs;
-    return false;
+bool da_truncar(DataArea *da) {
+    FILE *nuevo = freopen(NULL, "w+b", da->fp);
+    if (!nuevo) return false;
+    da->fp = nuevo;
+    return true;
 }
 
-bool datos_abrir(const char *ruta_archivo) {
-    // TODO: implementar
-    (void)ruta_archivo;
-    return false;
+long da_contar_bloques(DataArea *da) {
+    fseek(da->fp, 0, SEEK_END);
+    long tam = ftell(da->fp);
+    return tam / (long)da_bloque_bytes();
 }
 
-void datos_cerrar(void) {
-    // TODO: implementar
-    if (fp) {
-        fclose(fp);
-        fp = NULL;
+bool da_leer_bloque(DataArea *da, long numero_bloque,
+                     IsamRegistro *regs_out, int *cantidad_out,
+                     int64_t *puntero_overflow_out) {
+    size_t tam_bloque = da_bloque_bytes();
+    uint8_t *buf = malloc(tam_bloque);
+    if (!buf) return false;
+
+    fseek(da->fp, numero_bloque * (long)tam_bloque, SEEK_SET);
+    if (fread(buf, 1, tam_bloque, da->fp) != tam_bloque) { free(buf); return false; }
+    da->accesos++;
+
+    int32_t cnt;
+    memcpy(&cnt, buf, sizeof(int32_t));
+    memcpy(puntero_overflow_out, buf + sizeof(int32_t), sizeof(int64_t));
+    *cantidad_out = cnt;
+
+    size_t base = sizeof(int32_t) + sizeof(int64_t);
+    for (int i = 0; i < cnt; i++) {
+        int64_t reservado_dummy; /* el area de datos no usa este campo */
+        registro_deserializar(buf + base + (size_t)i * registro_bytes(), &regs_out[i], &reservado_dummy);
     }
+    free(buf);
+    return true;
 }
 
-bool datos_leer_bloque(int num_bloque, Bloque *bloque) {
-    // TODO: implementar
-    (void)num_bloque;
-    (void)bloque;
-    return false;
+bool da_escribir_bloque(DataArea *da, long numero_bloque,
+                         const IsamRegistro *regs, int cantidad,
+                         int64_t puntero_overflow) {
+    size_t tam_bloque = da_bloque_bytes();
+    uint8_t *buf = calloc(1, tam_bloque);
+    if (!buf) return false;
+
+    int32_t cnt = cantidad;
+    memcpy(buf, &cnt, sizeof(int32_t));
+    memcpy(buf + sizeof(int32_t), &puntero_overflow, sizeof(int64_t));
+
+    size_t base = sizeof(int32_t) + sizeof(int64_t);
+    for (int i = 0; i < cantidad; i++) {
+        /* ISAM_PUNTERO_NULO: el "siguiente" del registro no se usa aca,
+         * solo lo usan los registros que viven en el area de overflow. */
+        registro_serializar(&regs[i], ISAM_PUNTERO_NULO, buf + base + (size_t)i * registro_bytes());
+    }
+
+    fseek(da->fp, numero_bloque * (long)tam_bloque, SEEK_SET);
+    bool ok = fwrite(buf, 1, tam_bloque, da->fp) == tam_bloque;
+    fflush(da->fp);
+    da->accesos++;
+    free(buf);
+    return ok;
 }
 
-bool datos_escribir_bloque(int num_bloque, const Bloque *bloque) {
-    // TODO: implementar
-    (void)num_bloque;
-    (void)bloque;
-    return false;
+bool da_construir(DataArea *da, const IsamRegistro *registros_ordenados, size_t n) {
+    if (!da_truncar(da)) return false;
+
+    long bloque_actual = 0;
+    for (size_t i = 0; i < n; i += ISAM_FACTOR_CARGA) {
+        size_t fin = (i + ISAM_FACTOR_CARGA < n) ? i + ISAM_FACTOR_CARGA : n;
+        int cantidad = (int)(fin - i);
+        if (!da_escribir_bloque(da, bloque_actual, &registros_ordenados[i], cantidad, ISAM_PUNTERO_NULO))
+            return false;
+        bloque_actual++;
+    }
+    return true;
 }
 
-int datos_num_bloques(void) {
-    // TODO: implementar
-    return 0;
-}
-
-bool datos_buscar_en_bloque(int num_bloque, int clave, Registro *resultado) {
-    // TODO: implementar
-    (void)num_bloque;
-    (void)clave;
-    (void)resultado;
-    return false;
-}
+long da_accesos(DataArea *da) { return da->accesos; }
+void da_reiniciar_accesos(DataArea *da) { da->accesos = 0; }
