@@ -5,59 +5,88 @@
 #include "registro.h"
 #include "config.h"
 
+/* ============================================================
+ * DATA AREA — Area primaria del ISAM
+ *
+ * Responsabilidad de ESTE componente (los otros dos los hacen tus
+ * companeros):
+ *   - Guardar los registros en bloques de tamaño fijo, ordenados
+ *     por clave dentro de cada bloque y entre bloques.
+ *   - Construir el area desde una lista de registros (carga masiva).
+ *   - Dar acceso de lectura/escritura a un bloque por su numero,
+ *     para que el componente de INDICE pueda recorrerla al construir
+ *     su propio indice, y para que el area de OVERFLOW sepa a que
+ *     bloque pertenece un puntero cuando alguien inserta despues.
+ *
+ * Lo que NO hace este componente (y es importante que lo sepan
+ * los tres, para no duplicar trabajo):
+ *   - No sabe nada de busqueda por clave ni de indices — eso lo
+ *     decide el componente de indice, que usa df_leer_bloque() para
+ *     ir a buscar el bloque que el decida.
+ *   - No sabe leer la cadena de overflow — solo GUARDA el puntero
+ *     (el offset) al primer registro de esa cadena, por bloque.
+ *     Seguir la cadena es trabajo del componente de overflow.
+ *
+ * Layout de bloque en disco:
+ *   cantidad          int32_t   4 bytes  (cuantos registros hay, <= ISAM_REGS_POR_BLOQUE)
+ *   puntero_overflow  int64_t   8 bytes  (offset del primer registro de
+ *                                         overflow de ESTE bloque, o
+ *                                         ISAM_PUNTERO_NULO si no tiene)
+ *   registros         ISAM_REGS_POR_BLOQUE * registro_bytes()
+ * ============================================================ */
+
+typedef struct DataArea DataArea;
+
+/* Abre el archivo (lo crea si no existe). */
+DataArea *da_abrir(const char *ruta);
+void da_cerrar(DataArea *da);
+
+/* Vacia el archivo por completo. Se usa antes de una carga masiva
+ * o de una reorganizacion (cuando se reescribe todo desde cero). */
+bool da_truncar(DataArea *da);
+
+/* Tamaño en bytes de un bloque completo (cabecera + registros). */
+size_t da_bloque_bytes(void);
+
+/* Cuantos bloques hay actualmente en el archivo. */
+long da_contar_bloques(DataArea *da);
+
 /*
- * Un bloque = una página: la unidad de lectura/escritura del archivo de
- * datos. `regs` es un arreglo DINÁMICO (se reserva con
- * datos_reservar_bloque) porque cuántos registros caben por página
- * depende del tamaño real de la tabla activa (ver datos_factor_bloque).
+ * CONSTRUCCION (carga masiva).
+ * Recibe 'registros' YA ORDENADOS por clave (el area de datos no
+ * ordena por ustedes — eso puede hacerlo quien llama, con qsort,
+ * antes de pasar el arreglo aca). Los reparte en bloques de a
+ * ISAM_FACTOR_CARGA registros (deja espacio libre en cada bloque
+ * a proposito, para que las primeras inserciones no vayan directo
+ * a overflow). Trunca el archivo antes de escribir.
  */
-typedef struct {
-    Registro *regs;      // arreglo reservado con datos_reservar_bloque()
-    int n;                 // registros ocupados (n <= datos_factor_bloque())
-    int ptr_overflow;      // -1 si no tiene cadena de overflow, o posición en overflow.dat
-} Bloque;
+bool da_construir(DataArea *da, const IsamRegistro *registros_ordenados, size_t n);
 
-/* ============ Responsable: Persona A (módulo DATOS) ============
- * Encargado de crear y mantener el archivo binario de datos de UNA tabla
- * (la carpeta/ruta se la pasa quien integra): la parte "estática" de la
- * ISAM (opción 1: todo en un .dat en disco).
+/*
+ * Lee el bloque 'numero_bloque' completo: cuantos registros tiene,
+ * cuales son, y el puntero a su cadena de overflow (que ESTE
+ * componente no sabe interpretar, solo lo devuelve tal cual esta
+ * guardado).
+ *
+ * 'regs_out' debe tener espacio para ISAM_REGS_POR_BLOQUE registros.
  */
+bool da_leer_bloque(DataArea *da, long numero_bloque,
+                     IsamRegistro *regs_out, int *cantidad_out,
+                     int64_t *puntero_overflow_out);
 
-// Cuántos registros caben en UNA página, según la tabla activa
-// (llamar DESPUÉS de registro_configurar_tam(), si no siempre da el mismo
-// número cacheado). Se calcula como:
-//   TAM_PAGINA / (sizeof(int) + registro_tam_actual())
-// Esto es lo que hace que una tabla con filas chicas quepa más por página
-// que una con filas grandes — ya NO es un número fijo como antes.
-int datos_factor_bloque(void);
+/*
+ * Reescribe el bloque 'numero_bloque' completo. Quien llama es
+ * responsable de que 'regs' ya este ordenado por clave y de pasar
+ * el puntero de overflow correcto (si no cambia, hay que volver a
+ * pasar el mismo valor que devolvio da_leer_bloque(), si no se
+ * pierde la cadena existente).
+ */
+bool da_escribir_bloque(DataArea *da, long numero_bloque,
+                         const IsamRegistro *regs, int cantidad,
+                         int64_t puntero_overflow);
 
-// Reserva bloque->regs con el tamaño correcto (datos_factor_bloque()
-// elementos) y deja bloque->n = 0, bloque->ptr_overflow = -1.
-// Llamar ANTES de datos_leer_bloque()/datos_escribir_bloque().
-bool datos_reservar_bloque(Bloque *bloque);
-
-// Libera bloque->regs. Llamar cuando ya no se use ese Bloque.
-void datos_liberar_bloque(Bloque *bloque);
-
-// Crea el archivo de datos en `ruta_archivo` a partir de un arreglo YA
-// ORDENADO por clave, repartiéndolo en páginas de datos_factor_bloque()
-// registros (carga inicial/estática).
-bool datos_crear(const char *ruta_archivo, const Registro *regs_ordenados, int n_regs);
-
-// Abre/cierra el archivo de datos para lectura y escritura.
-bool datos_abrir(const char *ruta_archivo);
-void datos_cerrar(void);
-
-// Lee/escribe el bloque (página) número `num_bloque` (0-indexado).
-// `bloque` debe venir ya reservado con datos_reservar_bloque().
-bool datos_leer_bloque(int num_bloque, Bloque *bloque);
-bool datos_escribir_bloque(int num_bloque, const Bloque *bloque);
-
-// Cantidad total de páginas que existen actualmente en el archivo.
-int datos_num_bloques(void);
-
-// Busca `clave` SOLO dentro del bloque `num_bloque` (no sigue overflow;
-// eso lo resuelve quien integra, usando el módulo overflow si hace falta).
-bool datos_buscar_en_bloque(int num_bloque, int clave, Registro *resultado);
+/* Instrumentacion para el benchmark (accesos a disco = lecturas + escrituras). */
+long da_accesos(DataArea *da);
+void da_reiniciar_accesos(DataArea *da);
 
 #endif
